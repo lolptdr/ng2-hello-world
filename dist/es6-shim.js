@@ -29847,6 +29847,8 @@ function Zone(parentZone, data) {
     }
   });
 
+  zone.$id = ++Zone.nextId;
+
   return zone;
 }
 
@@ -29914,38 +29916,25 @@ Zone.patchSetClearFn = function (obj, fnNames) {
   }).
   forEach(function (name) {
     var setName = 'set' + name;
-    var clearName = 'clear' + name;
     var delegate = obj[setName];
 
     if (delegate) {
+      var clearName = 'clear' + name;
       var ids = {};
 
-      if (setName === 'setInterval') {
-        zone[setName] = function (fn) {
-          var id;
-          arguments[0] = function () {
-            delete ids[id];
-            return fn.apply(this, arguments);
-          };
-          var args = Zone.bindArguments(arguments);
-          id = delegate.apply(obj, args);
-          ids[id] = true;
-          return id;
-        };
-      } else {
-        zone[setName] = function (fn) {
-          var id;
-          arguments[0] = function () {
-            delete ids[id];
-            return fn.apply(this, arguments);
-          };
-          var args = Zone.bindArgumentsOnce(arguments);
-          id = delegate.apply(obj, args);
-          ids[id] = true;
-          return id;
-        };
-      }
+      var bindArgs = setName === 'setInterval' ? Zone.bindArguments : Zone.bindArgumentsOnce;
 
+      zone[setName] = function (fn) {
+        var id;
+        arguments[0] = function () {
+          delete ids[id];
+          return fn.apply(this, arguments);
+        };
+        var args = bindArgs(arguments);
+        id = delegate.apply(obj, args);
+        ids[id] = true;
+        return id;
+      };
 
       obj[setName] = function () {
         return zone[setName].apply(this, arguments);
@@ -29967,6 +29956,8 @@ Zone.patchSetClearFn = function (obj, fnNames) {
     }
   });
 };
+
+Zone.nextId = 1;
 
 
 Zone.patchSetFn = function (obj, fnNames) {
@@ -30018,6 +30009,52 @@ Zone.bindArgumentsOnce = function (args) {
   }
   return args;
 };
+
+/*
+ * patch a fn that returns a promise
+ */
+Zone.bindPromiseFn = (function() {
+  // if the browser natively supports Promises, we can just return a native promise
+  if (window.Promise) {
+    return function (delegate) {
+      return function() {
+        var delegatePromise = delegate.apply(this, arguments);
+        if (delegatePromise instanceof Promise) {
+          return delegatePromise;
+        } else {
+          return new Promise(function(resolve, reject) {
+            delegatePromise.then(resolve, reject);
+          });
+        }
+      };
+    };
+  } else {
+    // if the browser does not have native promises, we have to patch each promise instance
+    return function (delegate) {
+      return function () {
+        return patchThenable(delegate.apply(this, arguments));
+      };
+    };
+  }
+
+  function patchThenable(thenable) {
+    var then = thenable.then;
+    thenable.then = function () {
+      var args = Zone.bindArguments(arguments);
+      var nextThenable = then.apply(thenable, args);
+      return patchThenable(nextThenable);
+    };
+
+    var ocatch = thenable.catch;
+    thenable.catch = function () {
+      var args = Zone.bindArguments(arguments);
+      var nextThenable = ocatch.apply(thenable, args);
+      return patchThenable(nextThenable);
+    };
+    return thenable;
+  }
+}());
+
 
 Zone.patchableFn = function (obj, fnNames) {
   fnNames.forEach(function (name) {
@@ -30488,12 +30525,14 @@ Zone.longStackTraceZone = {
   getLongStacktrace: function (exception) {
     var trace = [];
     var zone = this;
-    if (zone.stackFramesFilter) {
-      trace.push(exception.stack.split('\n').
-          filter(zone.stackFramesFilter).
-          join('\n'));
-    } else {
-      trace.push(exception.stack);
+    if (exception) {
+      if (zone.stackFramesFilter) {
+        trace.push(exception.stack.split('\n').
+            filter(zone.stackFramesFilter).
+            join('\n'));
+      } else {
+        trace.push(exception.stack);
+      }
     }
     var now = Date.now();
     while (zone && zone.constructedAtException) {
